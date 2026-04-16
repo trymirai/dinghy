@@ -1,0 +1,25 @@
+[package]
+name = "dinghy-apple-host-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+libc = "0.2"
+dispatch2 = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+
+[target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))'.dependencies]
+objc2-core-foundation = "0.3"
+
+[target.'cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))'.dependencies.objc2-ui-kit]
+version = "0.3"
+features = [
+    "UIResponder", "UIView", "UIScrollView", "UITextView",
+    "UIViewController", "UIWindow", "UIFont", "UIFontDescriptor",
+    "UIColor", "UIScreen", "UIInterface",
+    "objc2-core-foundation",
+]

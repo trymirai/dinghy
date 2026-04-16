@@ -18,7 +18,7 @@ mod ssh;
 mod toolchain;
 pub mod utils;
 
-pub use crate::config::Configuration;
+pub use crate::config::{AppleConfiguration, Configuration};
 
 #[cfg(target_os = "macos")]
 use crate::apple::{IosManager, TvosManager, WatchosManager};
@@ -26,7 +26,7 @@ use crate::config::PlatformConfiguration;
 
 use crate::platform::regular_platform::RegularPlatform;
 use crate::project::Project;
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use dyn_clone::DynClone;
 use std::fmt::Display;
 use std::{path, sync};
@@ -161,6 +161,15 @@ pub trait Device: std::fmt::Debug + Display + DeviceCompatibility + DynClone {
         args: &[&str],
         envs: &[&str],
     ) -> Result<BuildBundle>;
+
+    fn copy_from_device(
+        &self,
+        _bundle: &BuildBundle,
+        _device_source: &str,
+        _host_destination: &path::Path,
+    ) -> Result<()> {
+        bail!("copy-from-device is not supported on this device")
+    }
 }
 
 dyn_clone::clone_trait_object!(Device);
@@ -215,6 +224,8 @@ pub struct Build {
     pub runnable: Runnable,
     pub target_path: path::PathBuf,
     pub files_in_run_args: Vec<path::PathBuf>,
+    pub apple_config: AppleConfiguration,
+    pub prebuilt_bundle: Option<BuildBundle>,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +236,7 @@ pub struct SetupArgs {
     pub cleanup: bool,
     pub strip: bool,
     pub device_id: Option<String>,
+    pub copy_back: Vec<String>,
 }
 
 impl SetupArgs {
@@ -254,6 +266,11 @@ impl SetupArgs {
         for env in &self.envs {
             extra_args.push_str("-e ");
             extra_args.push_str(env);
+            extra_args.push(' ');
+        }
+        for spec in &self.copy_back {
+            extra_args.push_str("--copy-back ");
+            extra_args.push_str(spec);
             extra_args.push(' ');
         }
 

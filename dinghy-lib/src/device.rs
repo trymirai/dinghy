@@ -12,7 +12,7 @@ pub fn make_remote_app(project: &Project, build: &Build) -> Result<BuildBundle> 
     make_remote_app_with_name(project, build, None)
 }
 
-pub fn make_remote_app_with_name(
+pub fn make_remote_bundle_with_name(
     project: &Project,
     build: &Build,
     bundle_name: Option<&str>,
@@ -48,18 +48,6 @@ pub fn make_remote_app_with_name(
     fs::create_dir_all(&bundle_path)?;
     fs::create_dir_all(&bundle_libs_path)?;
     fs::create_dir_all(&bundle_target_path)?;
-
-    debug!(
-        "Copying exe {:?} to bundle {:?}",
-        &build.runnable.exe, bundle_exe_path
-    );
-    copy_and_sync_file(&build.runnable.exe, &bundle_exe_path).with_context(|| {
-        format!(
-            "Couldn't copy {} to {}",
-            &build.runnable.exe.display(),
-            &bundle_exe_path.display()
-        )
-    })?;
 
     debug!("Copying dynamic libs to bundle");
     for src_lib_path in &build.dynamic_libraries {
@@ -135,4 +123,26 @@ pub fn make_remote_app_with_name(
         root_dir,
         app_id: None,
     })
+}
+
+pub fn make_remote_app_with_name(
+    project: &Project,
+    build: &Build,
+    bundle_name: Option<&str>,
+) -> Result<BuildBundle> {
+    let build_bundle = make_remote_bundle_with_name(project, build, bundle_name)?;
+
+    debug!(
+        "Copying exe {:?} to bundle {:?}",
+        &build.runnable.exe, build_bundle.bundle_exe
+    );
+    copy_and_sync_file(&build.runnable.exe, &build_bundle.bundle_exe).with_context(|| {
+        format!(
+            "Couldn't copy {} to {}",
+            &build.runnable.exe.display(),
+            &build_bundle.bundle_exe.display()
+        )
+    })?;
+
+    Ok(build_bundle)
 }

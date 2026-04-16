@@ -12,12 +12,10 @@ use crate::DeviceCompatibility;
 use crate::Runnable;
 use colored::Colorize;
 use fs_err as fs;
-use itertools::Itertools;
 use log::debug;
 use std::fmt;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{self, Stdio};
 use std::time::Duration;
@@ -29,6 +27,7 @@ pub struct IosDevice {
     pub arch_cpu: &'static str,
     rustc_triple: String,
     pub os: String,
+    pub coredevice_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +41,13 @@ pub struct AppleSimDevice {
 unsafe impl Send for IosDevice {}
 
 impl IosDevice {
-    pub fn new(name: String, id: String, arch_cpu: &str, os: String) -> Result<IosDevice> {
+    pub fn new(
+        name: String,
+        id: String,
+        arch_cpu: &str,
+        os: String,
+        coredevice_id: Option<String>,
+    ) -> Result<IosDevice> {
         let cpu = match &*arch_cpu {
             "arm64" | "arm64e" => "aarch64",
             _ => "armv7",
@@ -53,16 +58,13 @@ impl IosDevice {
             os,
             arch_cpu: cpu.into(),
             rustc_triple: format!("{}-apple-ios", cpu),
+            coredevice_id,
         })
     }
 
-    fn is_pre_ios_17(&self) -> Result<bool> {
-        Ok(semver::VersionReq::parse(&self.os)?
-            .comparators
-            .get(0)
-            .ok_or_else(|| anyhow!("Invalid iOS version: {}", self.os))?
-            .major
-            < 17)
+    /// Returns the identifier to use with `xcrun devicectl` commands.
+    fn devicectl_id(&self) -> &str {
+        self.coredevice_id.as_deref().unwrap_or(&self.id)
     }
 
     fn is_locked(&self) -> Result<bool> {
@@ -71,7 +73,7 @@ impl IosDevice {
                 "devicectl device info lockState --quiet --json-output /dev/stdout --device"
                     .split_whitespace(),
             )
-            .arg(&self.id)
+            .arg(self.devicectl_id())
             .log_invocation(1)
             .output()
             .context("Failed to run devicectl device info lockState")?;
@@ -91,7 +93,7 @@ impl IosDevice {
         build: &Build,
         runnable: &Runnable,
     ) -> Result<BuildBundle> {
-        let signing = xcode::look_for_signature_settings(&self.id)?
+        let signing = xcode::look_for_signature_settings(&self.id, &build.apple_config)?
             .pop()
             .ok_or_else(|| anyhow!("no signing identity found"))?;
         let app_id = signing
@@ -100,10 +102,18 @@ impl IosDevice {
             .last()
             .ok_or_else(|| anyhow!("no app id ?"))?;
 
-        let mut build_bundle = make_apple_app(project, build, runnable, &app_id, None)?;
+        let mut build_bundle = if let Some(build_bundle) = build.prebuilt_bundle.clone() {
+            build_bundle
+        } else {
+            make_apple_app(project, build, runnable, &app_id, None)?
+        };
+        if build.prebuilt_bundle.is_some() {
+            let target = binary_arch(&build_bundle.bundle_exe)?;
+            xcode::add_plist_to_app(&build_bundle, &target, &app_id, None, &build.apple_config)?;
+        }
         build_bundle.app_id = Some(app_id.to_owned());
 
-        super::xcode::sign_app(&build_bundle, &signing)?;
+        super::xcode::sign_app(&build_bundle, &signing, &build.apple_config)?;
         Ok(build_bundle)
     }
 
@@ -120,15 +130,9 @@ impl IosDevice {
         );
         let build_bundle = self.make_app(project, build, runnable)?;
         let bundle = build_bundle.bundle_dir.to_string_lossy();
-        if self.is_pre_ios_17()? {
-            self.install_app_with_ios_deploy(&bundle)?;
-            return Ok(build_bundle);
-        }
-
-        // xcrun devicectl device install app --device 00008110-001XXXXXXXXXX ./xgen/Build/Products/Release-iphoneos/nilo.app
         let result = process::Command::new("xcrun")
             .args("devicectl device install app --device".split_whitespace())
-            .arg(&self.id)
+            .arg(self.devicectl_id())
             .arg(&*bundle)
             .log_invocation(1)
             .status()
@@ -139,64 +143,79 @@ impl IosDevice {
         Ok(build_bundle)
     }
 
+    fn launch_app_with_devicectl(
+        &self,
+        app_id: &str,
+        args: &[&str],
+        envs: &[&str],
+        capture_stdout: bool,
+    ) -> Result<Option<String>> {
+        let mut cmd = process::Command::new("xcrun");
+        cmd.args(
+            "devicectl device process launch --console --terminate-existing --device"
+                .split_whitespace(),
+        );
+        cmd.arg(self.devicectl_id());
+
+        if !envs.is_empty() {
+            let env_json = format!(
+                "{{{}}}",
+                envs.iter()
+                    .filter_map(|e| {
+                        let mut parts = e.splitn(2, '=');
+                        let key = parts.next()?;
+                        let val = parts.next().unwrap_or("");
+                        Some(format!("\"{}\": \"{}\"", key, val))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            cmd.arg("--environment-variables").arg(&env_json);
+        }
+
+        cmd.arg(app_id);
+        cmd.args(args);
+        cmd.stderr(Stdio::inherit());
+        cmd.stdin(Stdio::inherit());
+
+        if capture_stdout {
+            cmd.stdout(Stdio::piped());
+            let output = cmd
+                .log_invocation(1)
+                .spawn()
+                .context("Failed to run devicectl device process launch")?
+                .wait_with_output()
+                .context("Failed waiting for devicectl device process launch")?;
+
+            if !output.status.success() {
+                bail!(
+                    "Run on device failed (exit code: {:?})",
+                    output.status.code()
+                )
+            }
+
+            Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+        } else {
+            cmd.stdout(Stdio::inherit());
+            let status = cmd
+                .log_invocation(1)
+                .status()
+                .context("Failed to run devicectl device process launch")?;
+
+            if !status.success() {
+                bail!("Run on device failed (exit code: {:?})", status.code())
+            }
+
+            Ok(None)
+        }
+    }
+
     fn run_remote(
         &self,
         build_bundle: &BuildBundle,
         args: &[&str],
         envs: &[&str],
-        debugger: bool,
     ) -> Result<()> {
-        if self.is_pre_ios_17()? {
-            return self.run_remote_with_ios_deploy(build_bundle, args, envs, debugger);
-        }
-        let app_list = process::Command::new("pymobiledevice3")
-            .args("apps list --no-color --udid".split_whitespace())
-            .arg(&self.id)
-            .output()?;
-        let app_list = json::parse(std::str::from_utf8(&app_list.stdout)?).with_context(|| {
-            format!(
-                "Ran `pymobiledevice3 apps list --no-color --udid {}`, could not parse expected JSON output.", self.id,
-            )
-        })?;
-        let app_path = build_bundle.bundle_dir.to_string_lossy();
-        let app = app_list
-            .entries()
-            .find(|e| e.0 == build_bundle.app_id.as_ref().unwrap())
-            .unwrap()
-            .1;
-        let remote_path = app["Path"].to_string();
-
-        let tunnel = process::Command::new("sudo")
-            .arg("-p")
-            .arg(format!(
-                "Please enter %p's password on %h to start a tunnel to '{}' (sudo):",
-                self.name
-            ))
-            .args("pymobiledevice3 remote start-tunnel --script-mode --udid".split_whitespace())
-            .arg(&self.id)
-            .stderr(Stdio::inherit())
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let mut rsd = String::new();
-        BufReader::new(tunnel.stdout.unwrap()).read_line(&mut rsd)?;
-        debug!("iOS RSD tunnel started: {rsd}");
-
-        // start the debugserver
-        let server = process::Command::new("pymobiledevice3")
-            .args("developer debugserver start-server --rsd".split_whitespace())
-            .args(rsd.trim().split_whitespace())
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let lldb_connection_string = BufReader::new(server.stdout.unwrap())
-            .lines()
-            .find(|l| l.as_ref().unwrap().contains("process connect connect://"))
-            .unwrap()
-            .unwrap();
-        let connection_details = lldb_connection_string.split_whitespace().nth(3).unwrap();
-        debug!("iOS debugserver started: {connection_details}");
-
         if self.is_locked()? {
             eprint!(
                 "{}",
@@ -211,89 +230,12 @@ impl IosDevice {
             }
         }
 
-        let tempdir = tempfile::TempDir::with_prefix("dinghy-lldb")?;
-        let script_path = tempdir.path().join("run.lldb");
-        // see https://stackoverflow.com/questions/77865860/lldb-hangs-when-trying-to-execute-command-with-o
-        // for the terrible async thing
-        std::fs::write(
-            &script_path,
-            format!(
-                "
-platform select remote-ios
-target create {app_path}
-script lldb.target.module[0].SetPlatformFileSpec(lldb.SBFileSpec('{remote_path}'))
-script old_debug = lldb.debugger.GetAsync()
-script lldb.debugger.SetAsync(True)
-process connect {connection_details}
-script lldb.debugger.SetAsync(old_debug)
-run {}
-exit
-            ",
-                args.iter()
-                    .map(|&s| shell_escape::escape(s.into()))
-                    .join(" ")
-            ),
-        )?;
+        let app_id = build_bundle
+            .app_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("No app_id in build bundle"))?;
 
-        let lldb = process::Command::new("lldb")
-            .arg("--batch")
-            .arg("-s")
-            .arg(script_path)
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let mut lines = BufReader::new(lldb.stdout.unwrap()).lines();
-        while !lines.next().unwrap()?.starts_with("(lldb) run") {}
-        for line in lines {
-            let line = line?;
-            println!("{}", line);
-            if line.contains("exited with status = ") {
-                let rv = line.split_whitespace().nth(6).unwrap();
-                println!("returns: {rv}");
-                if rv == "0" {
-                    return Ok(());
-                } else {
-                    bail!("Failed")
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // LEGACY IOS-DEPLOY BASED WORKFLOW (iOS<17)
-    fn install_app_with_ios_deploy(&self, bundle: &str) -> Result<()> {
-        process::Command::new("ios-deploy")
-            .args(&["-i", &self.id, "-b", &bundle, "-n"])
-            .log_invocation(1)
-            .output()
-            .context("Failed to run ios-deploy")?
-            .status;
-        Ok(())
-    }
-
-    fn run_remote_with_ios_deploy(
-        &self,
-        build_bundle: &BuildBundle,
-        args: &[&str],
-        envs: &[&str],
-        debugger: bool,
-    ) -> Result<()> {
-        let bundle = build_bundle.bundle_dir.to_string_lossy();
-        let mut command = process::Command::new("ios-deploy");
-        command.args(&["-i", &self.id, "-b", &bundle, "-m"]);
-        command.args(&["-a", &args.join(" ")]);
-        command.args(&["-s", &envs.join(" ")]);
-        command.arg(if debugger { "-d" } else { "-I" });
-        command.stderr(process::Stdio::inherit());
-        command.stdout(process::Stdio::inherit());
-        let status = command
-            .log_invocation(1)
-            .output()
-            .context("Failed to run ios-deploy")?
-            .status;
-        if !status.success() {
-            bail!("Run on device failed")
-        }
+        self.launch_app_with_devicectl(app_id, args, envs, false)?;
         Ok(())
     }
 }
@@ -320,7 +262,7 @@ impl Device for IosDevice {
                 0,
             );
         }
-        self.run_remote(&build_bundle, args, envs, true)?;
+        self.run_remote(&build_bundle, args, envs)?;
         Ok(build_bundle)
     }
 
@@ -349,8 +291,56 @@ impl Device for IosDevice {
                 0,
             );
         }
-        self.run_remote(&build_bundle, args, envs, false)?;
+        self.run_remote(&build_bundle, args, envs)?;
         Ok(build_bundle)
+    }
+
+    fn copy_from_device(
+        &self,
+        bundle: &BuildBundle,
+        device_source: &str,
+        host_destination: &Path,
+    ) -> Result<()> {
+        let app_id = bundle
+            .app_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("No app_id in build bundle; cannot copy from device"))?;
+        user_facing_log(
+            "Copying",
+            &format!(
+                "{} from device to {}",
+                device_source,
+                host_destination.display()
+            ),
+            0,
+        );
+        if let Some(parent) = host_destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let status = process::Command::new("xcrun")
+            .args(
+                "devicectl device copy from --domain-type appDataContainer --device"
+                    .split_whitespace(),
+            )
+            .arg(self.devicectl_id())
+            .arg("--domain-identifier")
+            .arg(app_id)
+            .arg("--source")
+            .arg(device_source)
+            .arg("--destination")
+            .arg(host_destination)
+            .log_invocation(1)
+            .status()
+            .context("Failed to run devicectl device copy from")?;
+        if !status.success() {
+            bail!(
+                "devicectl device copy from failed (exit code: {:?})",
+                status.code()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -400,7 +390,14 @@ impl AppleSimDevice {
         build: &Build,
         runnable: &Runnable,
     ) -> Result<BuildBundle> {
-        make_apple_app(project, build, runnable, "Dinghy", Some(&self.sim_type))
+        if let Some(mut build_bundle) = build.prebuilt_bundle.clone() {
+            let target = binary_arch(&build_bundle.bundle_exe)?;
+            xcode::add_plist_to_app(&build_bundle, &target, "Dinghy", Some(&self.sim_type), &build.apple_config)?;
+            build_bundle.app_id = Some("Dinghy".to_string());
+            Ok(build_bundle)
+        } else {
+            make_apple_app(project, build, runnable, "Dinghy", Some(&self.sim_type))
+        }
     }
 }
 
@@ -507,6 +504,23 @@ impl DeviceCompatibility for AppleSimDevice {
     }
 }
 
+fn binary_arch(executable: &Path) -> Result<String> {
+    let magic = process::Command::new("file")
+        .arg(
+            executable
+                .to_str()
+                .ok_or_else(|| anyhow!("path conversion to string: {:?}", executable))?,
+        )
+        .log_invocation(3)
+        .output()?;
+    Ok(String::from_utf8(magic.stdout)?
+        .split(' ')
+        .last()
+        .ok_or_else(|| anyhow!("empty magic"))?
+        .trim()
+        .to_string())
+}
+
 fn make_apple_app(
     project: &Project,
     build: &Build,
@@ -517,21 +531,8 @@ fn make_apple_app(
     use crate::project;
     let build_bundle = make_remote_app_with_name(project, build, Some("Dinghy.app"))?;
     project::rec_copy(&runnable.exe, build_bundle.bundle_dir.join("Dinghy"), false)?;
-    let magic = process::Command::new("file")
-        .arg(
-            runnable
-                .exe
-                .to_str()
-                .ok_or_else(|| anyhow!("path conversion to string: {:?}", runnable.exe))?,
-        )
-        .log_invocation(3)
-        .output()?;
-    let magic = String::from_utf8(magic.stdout)?;
-    let target = magic
-        .split(" ")
-        .last()
-        .ok_or_else(|| anyhow!("empty magic"))?;
-    xcode::add_plist_to_app(&build_bundle, target, app_id, sim_type)?;
+    let target = binary_arch(&runnable.exe)?;
+    xcode::add_plist_to_app(&build_bundle, &target, app_id, sim_type, &build.apple_config)?;
     Ok(build_bundle)
 }
 

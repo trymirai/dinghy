@@ -1,0 +1,8 @@
+[package]
+name = "dinghy-apple-runner-support"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+criterion = "0.8"
+inventory = "0.3"

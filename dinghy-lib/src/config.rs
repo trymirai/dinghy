@@ -84,6 +84,17 @@ pub struct Configuration {
     pub script_devices: collections::BTreeMap<String, ScriptDeviceConfiguration>,
     pub test_data: Vec<TestData>,
     pub skip_source_copy: bool,
+    pub apple: AppleConfiguration,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct AppleConfiguration {
+    pub team_id: Option<String>,
+    pub bundle_id: Option<String>,
+    pub bundle_name: Option<String>,
+    pub deployment_target: Option<String>,
+    pub plist_extra: Option<collections::BTreeMap<String, toml::Value>>,
+    pub entitlements_extra: Option<Vec<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -93,6 +104,7 @@ struct ConfigurationFileContent {
     pub script_devices: Option<collections::BTreeMap<String, ScriptDeviceConfiguration>>,
     pub test_data: Option<collections::BTreeMap<String, TestDataConfiguration>>,
     pub skip_source_copy: Option<bool>,
+    pub apple: Option<AppleConfiguration>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -178,6 +190,32 @@ impl Configuration {
         }
         if let Some(skip_source_copy) = other.skip_source_copy {
             self.skip_source_copy = skip_source_copy
+        }
+        if let Some(apple) = other.apple {
+            if let Some(id) = apple.team_id {
+                self.apple.team_id = Some(id);
+            }
+            if let Some(id) = apple.bundle_id {
+                self.apple.bundle_id = Some(id);
+            }
+            if let Some(name) = apple.bundle_name {
+                self.apple.bundle_name = Some(name);
+            }
+            if let Some(target) = apple.deployment_target {
+                self.apple.deployment_target = Some(target);
+            }
+            if let Some(extra) = apple.plist_extra {
+                self.apple
+                    .plist_extra
+                    .get_or_insert_with(collections::BTreeMap::new)
+                    .extend(extra);
+            }
+            if let Some(extra) = apple.entitlements_extra {
+                self.apple
+                    .entitlements_extra
+                    .get_or_insert_with(Vec::new)
+                    .extend(extra);
+            }
         }
         Ok(())
     }

@@ -5,6 +5,7 @@ use log::{debug, trace};
 use std::io::Write;
 use std::{io, process};
 
+use crate::config::AppleConfiguration;
 use crate::utils::LogCommandExt;
 use crate::BuildBundle;
 
@@ -13,7 +14,13 @@ pub fn add_plist_to_app(
     arch: &str,
     app_bundle_id: &str,
     sim_type: Option<&AppleSimulatorType>,
+    apple_config: &AppleConfiguration,
 ) -> Result<()> {
+    let bundle_name = apple_config
+        .bundle_name
+        .as_deref()
+        .unwrap_or("Dinghy");
+
     let mut plist = fs::File::create(bundle.bundle_dir.join("Info.plist"))?;
     writeln!(plist, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
     writeln!(
@@ -21,7 +28,11 @@ pub fn add_plist_to_app(
         r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#
     )?;
     writeln!(plist, r#"<plist version="1.0"><dict>"#)?;
-    writeln!(plist, "<key>CFBundleName</key><string>Dinghy</string>",)?;
+    writeln!(
+        plist,
+        "<key>CFBundleName</key><string>{}</string>",
+        bundle_name,
+    )?;
     writeln!(
         plist,
         "<key>CFBundleExecutable</key><string>Dinghy</string>",
@@ -36,24 +47,76 @@ pub fn add_plist_to_app(
     writeln!(plist, "<key>CFBundleShortVersionString</key>")?;
     writeln!(plist, "<string>{}</string>", arch)?;
     match sim_type {
-        // The iOS/tvOS simulator have the same plist as an iOS device.
         Some(AppleSimulatorType::Ios) | Some(AppleSimulatorType::Tvos) | None => {
             writeln!(plist, "<key>UIRequiredDeviceCapabilities</key>")?;
             writeln!(plist, "<array><string>{}</string></array>", arch)?;
             writeln!(plist, "<key>UILaunchStoryboardName</key>")?;
             writeln!(plist, "<string></string>")?;
+            if let Some(target) = &apple_config.deployment_target {
+                writeln!(
+                    plist,
+                    "<key>MinimumOSVersion</key><string>{}</string>",
+                    target
+                )?;
+            }
         }
         Some(AppleSimulatorType::Watchos) => {
-            writeln!(plist, "<key>MinimumOSVersion</key><string>8.0</string>",)?;
+            let min_os = apple_config
+                .deployment_target
+                .as_deref()
+                .unwrap_or("8.0");
+            writeln!(
+                plist,
+                "<key>MinimumOSVersion</key><string>{}</string>",
+                min_os,
+            )?;
             writeln!(plist, "<key>WKApplication</key><true/>",)?;
             writeln!(plist, "<key>WKWatchOnly</key><true/>")?;
+        }
+    }
+    if let Some(extra) = &apple_config.plist_extra {
+        for (key, value) in extra {
+            write!(plist, "<key>{}</key>", key)?;
+            write_toml_value_as_plist(&mut plist, value)?;
+            writeln!(plist)?;
         }
     }
     writeln!(plist, r#"</dict></plist>"#)?;
     Ok(())
 }
 
-pub fn sign_app(bundle: &BuildBundle, settings: &SignatureSettings) -> Result<()> {
+fn write_toml_value_as_plist(writer: &mut impl Write, value: &toml::Value) -> Result<()> {
+    match value {
+        toml::Value::Boolean(true) => write!(writer, "<true/>")?,
+        toml::Value::Boolean(false) => write!(writer, "<false/>")?,
+        toml::Value::Integer(n) => write!(writer, "<integer>{}</integer>", n)?,
+        toml::Value::Float(f) => write!(writer, "<real>{}</real>", f)?,
+        toml::Value::String(s) => write!(writer, "<string>{}</string>", s)?,
+        toml::Value::Array(arr) => {
+            write!(writer, "<array>")?;
+            for item in arr {
+                write_toml_value_as_plist(writer, item)?;
+            }
+            write!(writer, "</array>")?;
+        }
+        toml::Value::Table(map) => {
+            write!(writer, "<dict>")?;
+            for (k, v) in map {
+                write!(writer, "<key>{}</key>", k)?;
+                write_toml_value_as_plist(writer, v)?;
+            }
+            write!(writer, "</dict>")?;
+        }
+        toml::Value::Datetime(dt) => write!(writer, "<string>{}</string>", dt)?,
+    }
+    Ok(())
+}
+
+pub fn sign_app(
+    bundle: &BuildBundle,
+    settings: &SignatureSettings,
+    apple_config: &AppleConfiguration,
+) -> Result<()> {
     debug!(
         "Will sign {:?} with team: {} using key: {} and profile: {}",
         bundle.bundle_dir, settings.identity.team, settings.identity.name, settings.file
@@ -69,6 +132,11 @@ pub fn sign_app(bundle: &BuildBundle, settings: &SignatureSettings) -> Result<()
     )?;
     writeln!(plist, r#"<plist version="1.0"><dict>"#)?;
     writeln!(plist, "{}", settings.entitlements)?;
+    if let Some(extra) = &apple_config.entitlements_extra {
+        for line in extra {
+            writeln!(plist, "{}", line)?;
+        }
+    }
     writeln!(plist, r#"</dict></plist>"#)?;
 
     let result = process::Command::new("codesign")
@@ -83,7 +151,10 @@ pub fn sign_app(bundle: &BuildBundle, settings: &SignatureSettings) -> Result<()
     Ok(())
 }
 
-pub fn look_for_signature_settings(device_id: &str) -> Result<Vec<SignatureSettings>> {
+pub fn look_for_signature_settings(
+    device_id: &str,
+    apple_config: &AppleConfiguration,
+) -> Result<Vec<SignatureSettings>> {
     let identity_regex = ::regex::Regex::new(r#"^ *[0-9]+\) ([A-Z0-9]{40}) "(.+)"$"#)?;
     let subject_regex = ::regex::Regex::new(r#"OU *= *([^,]+)"#)?;
     let mut identities: Vec<SigningIdentity> = vec![];
@@ -115,6 +186,9 @@ pub fn look_for_signature_settings(device_id: &str) -> Result<Vec<SignatureSetti
                 })
             }
         }
+    }
+    if let Some(team) = &apple_config.team_id {
+        identities.retain(|id| &id.team == team);
     }
     debug!("Possible signing identities: {:?}", identities);
     let mut settings = vec![];
@@ -216,7 +290,9 @@ pub fn look_for_signature_settings(device_id: &str) -> Result<Vec<SignatureSetti
                 .to_str()
                 .ok_or_else(|| anyhow!("filename should be utf8"))?
                 .into(),
-            name: if name.ends_with(" *") {
+            name: if let Some(bundle_id) = &apple_config.bundle_id {
+                bundle_id.clone()
+            } else if name.ends_with(" *") {
                 "org.zoy.kali.Dinghy".into()
             } else {
                 name.into()

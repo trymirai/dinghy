@@ -21,6 +21,7 @@ use dinghy_lib::{Device, Runnable};
 
 use crate::cli::{DinghyCli, DinghyMode, DinghySubcommand, SubCommandWrapper};
 
+mod apple_host;
 mod cli;
 
 fn main() {
@@ -62,6 +63,7 @@ fn run_command(cli: DinghyCli) -> Result<()> {
         cleanup: cli.args.cleanup,
         strip: cli.args.strip, // TODO this should probably be configurable in the config as well
         device_id: device.as_ref().map(|d| d.id().to_string()),
+        copy_back: cli.args.copy_back.clone(),
     };
 
     match cli.mode {
@@ -175,7 +177,6 @@ fn run_command(cli: DinghyCli) -> Result<()> {
 
                 let mut build = Build {
                     setup_args,
-                    // TODO these should be probably read from the executable file
                     dynamic_libraries: vec![],
                     runnable: Runnable {
                         id: exe_id,
@@ -187,16 +188,31 @@ fn run_command(cli: DinghyCli) -> Result<()> {
                     },
                     target_path: project.metadata.target_directory.clone().into(),
                     files_in_run_args,
+                    prebuilt_bundle: None,
+                    apple_config: conf.apple.clone(),
                 };
 
-                if cli.args.strip {
+                if cli.args.strip && !final_platform.rustc_triple().contains("-apple-") {
                     final_platform.strip(&mut build)?;
+                }
+
+                if let Some(prebuilt_bundle) =
+                    apple_host::prepare_generated_apple_host(&project, &final_platform, &build, &args)?
+                {
+                    build.prebuilt_bundle = Some(prebuilt_bundle.clone());
+                    build.runnable.exe = prebuilt_bundle.bundle_exe.clone();
+                    build.runnable.skip_source_copy = true;
                 }
 
                 let bundle = device.run_app(
                     &project, &build, &args_ref,
                     &envs_ref, // TODO these are also in the SetupArgs
                 )?;
+
+                for spec in &cli.args.copy_back {
+                    let (device_source, host_destination) = parse_copy_back_spec(spec)?;
+                    device.copy_from_device(&bundle, device_source, &host_destination)?;
+                }
 
                 // TODO this is not done if the run fails
                 if cli.args.cleanup {
@@ -379,6 +395,8 @@ fn run_command(cli: DinghyCli) -> Result<()> {
                     },
                     target_path: Default::default(),
                     files_in_run_args: vec![],
+                    prebuilt_bundle: None,
+                    apple_config: conf.apple.clone(),
                 };
                 platform.strip(&mut lib_build)?;
 
@@ -414,6 +432,22 @@ fn run_command(cli: DinghyCli) -> Result<()> {
             anyhow::bail!("Naked mode") // what should we do?
         }
     }
+}
+
+fn parse_copy_back_spec(spec: &str) -> Result<(&str, PathBuf)> {
+    let (device_source, host_destination) = spec.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!(
+            "--copy-back expects SRC=DST, got {:?} (missing '=')",
+            spec
+        )
+    })?;
+    if device_source.is_empty() {
+        bail!("--copy-back SRC must not be empty in {:?}", spec);
+    }
+    if host_destination.is_empty() {
+        bail!("--copy-back DST must not be empty in {:?}", spec);
+    }
+    Ok((device_source, PathBuf::from(host_destination)))
 }
 
 fn create_cargo_subcomand(

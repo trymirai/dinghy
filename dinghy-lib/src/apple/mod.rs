@@ -285,6 +285,9 @@ fn devices_from_devicectl(devices: &mut HashMap<String, IosDevice>) -> Result<()
         else {
             continue;
         };
+        let coredevice_id = device["identifier"]
+            .as_str()
+            .map(|s| s.to_string());
         let device = IosDevice::new(
             device["deviceProperties"]["name"]
                 .as_str()
@@ -298,6 +301,7 @@ fn devices_from_devicectl(devices: &mut HashMap<String, IosDevice>) -> Result<()
                 .as_str()
                 .context("no osVersionNumber")?
                 .to_string(),
+            coredevice_id,
         )?;
         devices.insert(udid, device);
     }
@@ -346,7 +350,7 @@ fn devices_from_ios_deploy(devices: &mut HashMap<String, IosDevice>) -> Result<(
             .to_string();
         devices.insert(
             name.clone(),
-            IosDevice::new(name, id, &arch_cpu, ios_version)?,
+            IosDevice::new(name, id, &arch_cpu, ios_version, None)?,
         );
     }
     Ok(())

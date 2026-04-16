@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "cargo-dinghy",
+    "cargo-dinghy", "dinghy-apple-host-runtime", "dinghy-apple-runner-macros", "dinghy-apple-runner-support",
     "dinghy-build",
     "dinghy-lib",
     "dinghy-test",

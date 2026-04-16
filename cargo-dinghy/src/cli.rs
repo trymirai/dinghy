@@ -24,6 +24,12 @@ pub struct DinghyGeneralArgs {
     #[arg(long, short)]
     pub env: Vec<String>,
 
+    /// Copy a file or directory back from the device to the host after the run.
+    /// Format: SRC=DST (SRC is interpreted by the device, e.g. relative to the
+    /// app data container on iOS). Can be passed multiple times.
+    #[arg(long, value_name = "SPEC")]
+    pub copy_back: Vec<String>,
+
     /// Cleanup target device after completion
     #[arg(long, short)]
     pub cleanup: bool,
