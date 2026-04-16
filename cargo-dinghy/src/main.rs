@@ -16,7 +16,7 @@ use dinghy_lib::project::Project;
 use dinghy_lib::utils::{set_current_verbosity, user_facing_log, LogCommandExt};
 use dinghy_lib::Dinghy;
 use dinghy_lib::Platform;
-use dinghy_lib::{Build, SetupArgs};
+use dinghy_lib::{Build, SetupArgs, SyncDirSpec};
 use dinghy_lib::{Device, Runnable};
 
 use crate::cli::{DinghyCli, DinghyMode, DinghySubcommand, SubCommandWrapper};
@@ -53,8 +53,11 @@ fn run_command(cli: DinghyCli) -> Result<()> {
 
     let project = Project::new(&conf, metadata);
     let dinghy = Dinghy::probe(&conf)?;
+    let workspace_root = project.metadata.workspace_root.as_std_path();
 
     let (platform, device) = select_platform_and_device_from_cli(&cli, &dinghy)?;
+    let copy_back = resolve_sync_dir_specs(&cli.args.copy_back, workspace_root)?;
+    let sync_dirs = resolve_sync_dir_specs(&cli.args.sync_dirs, workspace_root)?;
 
     let setup_args = SetupArgs {
         verbosity: cli.args.verbose as i8 - cli.args.quiet as i8,
@@ -63,7 +66,8 @@ fn run_command(cli: DinghyCli) -> Result<()> {
         cleanup: cli.args.cleanup,
         strip: cli.args.strip, // TODO this should probably be configurable in the config as well
         device_id: device.as_ref().map(|d| d.id().to_string()),
-        copy_back: cli.args.copy_back.clone(),
+        copy_back,
+        sync_dirs,
     };
 
     match cli.mode {
@@ -209,9 +213,8 @@ fn run_command(cli: DinghyCli) -> Result<()> {
                     &envs_ref, // TODO these are also in the SetupArgs
                 )?;
 
-                for spec in &cli.args.copy_back {
-                    let (device_source, host_destination) = parse_copy_back_spec(spec)?;
-                    device.copy_from_device(&bundle, device_source, &host_destination)?;
+                for spec in &build.setup_args.copy_back {
+                    device.copy_from_device(&bundle, &spec.device_path, &spec.host_path)?;
                 }
 
                 // TODO this is not done if the run fails
@@ -434,20 +437,14 @@ fn run_command(cli: DinghyCli) -> Result<()> {
     }
 }
 
-fn parse_copy_back_spec(spec: &str) -> Result<(&str, PathBuf)> {
-    let (device_source, host_destination) = spec.split_once('=').ok_or_else(|| {
-        anyhow::anyhow!(
-            "--copy-back expects SRC=DST, got {:?} (missing '=')",
-            spec
-        )
-    })?;
-    if device_source.is_empty() {
-        bail!("--copy-back SRC must not be empty in {:?}", spec);
-    }
-    if host_destination.is_empty() {
-        bail!("--copy-back DST must not be empty in {:?}", spec);
-    }
-    Ok((device_source, PathBuf::from(host_destination)))
+fn resolve_sync_dir_specs(
+    specs: &[String],
+    workspace_root: &Path,
+) -> Result<Vec<SyncDirSpec>> {
+    specs
+        .iter()
+        .map(|spec| SyncDirSpec::parse(spec, workspace_root))
+        .collect()
 }
 
 fn create_cargo_subcomand(

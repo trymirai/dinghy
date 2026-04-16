@@ -10,6 +10,7 @@ use crate::BuildBundle;
 use crate::Device;
 use crate::DeviceCompatibility;
 use crate::Runnable;
+use crate::SyncDirSpec;
 use colored::Colorize;
 use fs_err as fs;
 use log::debug;
@@ -143,13 +144,22 @@ impl IosDevice {
         Ok(build_bundle)
     }
 
+    fn app_id<'a>(
+        &self,
+        build_bundle: &'a BuildBundle,
+    ) -> Result<&'a str> {
+        build_bundle
+            .app_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("No app_id in build bundle"))
+    }
+
     fn launch_app_with_devicectl(
         &self,
         app_id: &str,
         args: &[&str],
         envs: &[&str],
-        capture_stdout: bool,
-    ) -> Result<Option<String>> {
+    ) -> Result<process::ExitStatus> {
         let mut cmd = process::Command::new("xcrun");
         cmd.args(
             "devicectl device process launch --console --terminate-existing --device"
@@ -175,43 +185,48 @@ impl IosDevice {
 
         cmd.arg(app_id);
         cmd.args(args);
+        cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
         cmd.stdin(Stdio::inherit());
 
-        if capture_stdout {
-            cmd.stdout(Stdio::piped());
-            let output = cmd
-                .log_invocation(1)
-                .spawn()
-                .context("Failed to run devicectl device process launch")?
-                .wait_with_output()
-                .context("Failed waiting for devicectl device process launch")?;
+        cmd.log_invocation(1)
+            .status()
+            .context("Failed to run devicectl device process launch")
+    }
 
-            if !output.status.success() {
-                bail!(
-                    "Run on device failed (exit code: {:?})",
-                    output.status.code()
-                )
+    fn sync_dirs_to_device(
+        &self,
+        build_bundle: &BuildBundle,
+        sync_dirs: &[SyncDirSpec],
+    ) -> Result<()> {
+        for spec in sync_dirs {
+            if !spec.host_path.exists() {
+                debug!(
+                    "Skipping sync to device for missing host path {}",
+                    spec.host_path.display()
+                );
+                continue;
             }
-
-            Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
-        } else {
-            cmd.stdout(Stdio::inherit());
-            let status = cmd
-                .log_invocation(1)
-                .status()
-                .context("Failed to run devicectl device process launch")?;
-
-            if !status.success() {
-                bail!("Run on device failed (exit code: {:?})", status.code())
-            }
-
-            Ok(None)
+            self.copy_to_device(build_bundle, &spec.host_path, &spec.device_path)?;
         }
+        Ok(())
+    }
+
+    fn sync_dirs_from_device(
+        &self,
+        build_bundle: &BuildBundle,
+        sync_dirs: &[SyncDirSpec],
+    ) -> Result<()> {
+        for spec in sync_dirs {
+            fs::create_dir_all(&spec.host_path)?;
+            self.copy_from_device(build_bundle, &spec.device_path, &spec.host_path)?;
+        }
+        Ok(())
     }
 
     fn run_remote(
         &self,
+        build: &Build,
         build_bundle: &BuildBundle,
         args: &[&str],
         envs: &[&str],
@@ -230,12 +245,22 @@ impl IosDevice {
             }
         }
 
-        let app_id = build_bundle
-            .app_id
-            .as_ref()
-            .ok_or_else(|| anyhow!("No app_id in build bundle"))?;
+        let app_id = self.app_id(build_bundle)?;
+        self.sync_dirs_to_device(build_bundle, &build.setup_args.sync_dirs)?;
+        let status = self.launch_app_with_devicectl(app_id, args, envs)?;
+        let post_sync_result = self.sync_dirs_from_device(build_bundle, &build.setup_args.sync_dirs);
 
-        self.launch_app_with_devicectl(app_id, args, envs, false)?;
+        if !status.success() {
+            if let Err(sync_error) = post_sync_result {
+                log::warn!(
+                    "Failed to sync directories back from device after unsuccessful run: {}",
+                    sync_error
+                );
+            }
+            bail!("Run on device failed (exit code: {:?})", status.code());
+        }
+
+        post_sync_result?;
         Ok(())
     }
 }
@@ -262,7 +287,7 @@ impl Device for IosDevice {
                 0,
             );
         }
-        self.run_remote(&build_bundle, args, envs)?;
+        self.run_remote(build, &build_bundle, args, envs)?;
         Ok(build_bundle)
     }
 
@@ -291,8 +316,48 @@ impl Device for IosDevice {
                 0,
             );
         }
-        self.run_remote(&build_bundle, args, envs)?;
+        self.run_remote(build, &build_bundle, args, envs)?;
         Ok(build_bundle)
+    }
+
+    fn copy_to_device(
+        &self,
+        bundle: &BuildBundle,
+        host_source: &Path,
+        device_destination: &str,
+    ) -> Result<()> {
+        let app_id = self.app_id(bundle)?;
+        user_facing_log(
+            "Copying",
+            &format!(
+                "{} from host to {}",
+                host_source.display(),
+                device_destination
+            ),
+            0,
+        );
+        let status = process::Command::new("xcrun")
+            .args(
+                "devicectl device copy to --domain-type appDataContainer --device"
+                    .split_whitespace(),
+            )
+            .arg(self.devicectl_id())
+            .arg("--domain-identifier")
+            .arg(app_id)
+            .arg("--source")
+            .arg(host_source)
+            .arg("--destination")
+            .arg(device_destination)
+            .log_invocation(1)
+            .status()
+            .context("Failed to run devicectl device copy to")?;
+        if !status.success() {
+            bail!(
+                "devicectl device copy to failed (exit code: {:?})",
+                status.code()
+            );
+        }
+        Ok(())
     }
 
     fn copy_from_device(
@@ -301,10 +366,7 @@ impl Device for IosDevice {
         device_source: &str,
         host_destination: &Path,
     ) -> Result<()> {
-        let app_id = bundle
-            .app_id
-            .as_ref()
-            .ok_or_else(|| anyhow!("No app_id in build bundle; cannot copy from device"))?;
+        let app_id = self.app_id(bundle)?;
         user_facing_log(
             "Copying",
             &format!(

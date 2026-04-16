@@ -30,6 +30,11 @@ pub struct DinghyGeneralArgs {
     #[arg(long, value_name = "SPEC")]
     pub copy_back: Vec<String>,
 
+    /// Synchronize a host directory with a device directory before and after
+    /// the run. Format: HOST=DEVICE. Can be passed multiple times.
+    #[arg(long, value_name = "SPEC")]
+    pub sync_dirs: Vec<String>,
+
     /// Cleanup target device after completion
     #[arg(long, short)]
     pub cleanup: bool,

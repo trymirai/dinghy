@@ -162,6 +162,15 @@ pub trait Device: std::fmt::Debug + Display + DeviceCompatibility + DynClone {
         envs: &[&str],
     ) -> Result<BuildBundle>;
 
+    fn copy_to_device(
+        &self,
+        _bundle: &BuildBundle,
+        _host_source: &path::Path,
+        _device_destination: &str,
+    ) -> Result<()> {
+        bail!("copy-to-device is not supported on this device")
+    }
+
     fn copy_from_device(
         &self,
         _bundle: &BuildBundle,
@@ -229,6 +238,42 @@ pub struct Build {
 }
 
 #[derive(Clone, Debug)]
+pub struct SyncDirSpec {
+    pub host_path: path::PathBuf,
+    pub device_path: String,
+}
+
+impl SyncDirSpec {
+    pub fn parse(
+        spec: &str,
+        workspace_root: &path::Path,
+    ) -> Result<Self> {
+        let (host_path, device_path) = spec
+            .split_once('=')
+            .ok_or_else(|| anyhow!("sync dir spec must use HOST=DEVICE, got {:?}", spec))?;
+        if host_path.is_empty() {
+            bail!("sync dir HOST must not be empty in {:?}", spec);
+        }
+        if device_path.is_empty() {
+            bail!("sync dir DEVICE must not be empty in {:?}", spec);
+        }
+        let host_path = if path::Path::new(host_path).is_absolute() {
+            path::PathBuf::from(host_path)
+        } else {
+            workspace_root.join(host_path)
+        };
+        Ok(Self {
+            host_path,
+            device_path: device_path.to_owned(),
+        })
+    }
+
+    pub fn as_cli_arg(&self) -> String {
+        format!("{}={}", self.host_path.display(), self.device_path)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SetupArgs {
     pub verbosity: i8,
     pub forced_overlays: Vec<String>,
@@ -236,7 +281,8 @@ pub struct SetupArgs {
     pub cleanup: bool,
     pub strip: bool,
     pub device_id: Option<String>,
-    pub copy_back: Vec<String>,
+    pub copy_back: Vec<SyncDirSpec>,
+    pub sync_dirs: Vec<SyncDirSpec>,
 }
 
 impl SetupArgs {
@@ -270,7 +316,12 @@ impl SetupArgs {
         }
         for spec in &self.copy_back {
             extra_args.push_str("--copy-back ");
-            extra_args.push_str(spec);
+            extra_args.push_str(&spec.as_cli_arg());
+            extra_args.push(' ');
+        }
+        for spec in &self.sync_dirs {
+            extra_args.push_str("--sync-dirs ");
+            extra_args.push_str(&spec.as_cli_arg());
             extra_args.push(' ');
         }
 
