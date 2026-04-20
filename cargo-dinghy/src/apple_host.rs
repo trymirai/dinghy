@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use cargo_metadata::{Dependency, DependencyKind, Package, Target};
 use dinghy_lib::device::make_remote_bundle_with_name;
+use dinghy_lib::dinghy_config::DinghyWorkspaceConfig;
 use dinghy_lib::errors::*;
 use dinghy_lib::project::{Project, rec_copy_excl};
 use dinghy_lib::utils::LogCommandExt;
@@ -27,6 +28,8 @@ struct ResolvedTarget {
     source_relative_path: PathBuf,
 }
 
+const RUSTFLAGS_ENCODED_SEPARATOR: char = '\x1f';
+
 fn dinghy_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -45,6 +48,9 @@ pub fn prepare_generated_apple_host(
     }
 
     let resolved_target = resolve_target(project, build, runner_args)?;
+    let dinghy_config = DinghyWorkspaceConfig::from_workspace_metadata(
+        &project.metadata.workspace_metadata,
+    )?;
     let mut bundle = make_remote_bundle_with_name(project, build, Some("Dinghy.app"))?;
     bundle.bundle_exe = bundle.bundle_dir.join("Dinghy");
 
@@ -64,19 +70,19 @@ pub fn prepare_generated_apple_host(
         resolved_target.package.manifest_path.parent().unwrap().as_std_path(),
         &source_root,
     )?;
-    rewrite_rust_sources(&source_root)?;
+    rewrite_rust_sources(&source_root, &dinghy_config)?;
 
     write_workspace_manifest(&workspace_root)?;
-    write_runner_manifest(&runner_crate_root, &resolved_target)?;
+    write_runner_manifest(&runner_crate_root, &resolved_target, &dinghy_config)?;
     write_runner_source(&runner_crate_root, &source_root, &resolved_target)?;
-    write_host_manifest(&host_crate_root)?;
+    write_host_manifest(&host_crate_root, &dinghy_config)?;
     write_host_main(&host_crate_root)?;
     build_host_app_binary(
         &workspace_root,
         platform.rustc_triple(),
         &bundle.bundle_exe,
         build.runnable.exe.to_string_lossy().contains("/release/"),
-        build.runnable.package_name == "uzu",
+        &dinghy_config,
     )?;
 
     Ok(Some(bundle))
@@ -233,12 +239,12 @@ fn copy_package_sources(package_root: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_rust_sources(root: &Path) -> Result<()> {
+fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            rewrite_rust_sources(&path)?;
+            rewrite_rust_sources(&path, config)?;
             continue;
         }
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
@@ -250,13 +256,16 @@ fn rewrite_rust_sources(root: &Path) -> Result<()> {
         source = source.replace("#![test_runner(crate::bench_runner)]", "");
         source = source.replace("#![reexport_test_harness_main = \"test_main\"]", "");
         source = source.replace("cfg(test)", "cfg(any(test, dinghy_force_test))");
-        source = source.replace("#[uzu_test]", "#[dinghy_apple_runner_macros::test_case]");
         source = source.replace("#[test]", "#[dinghy_apple_runner_macros::test_case]");
         source = source.replace("#[ignore]", "#[dinghy_apple_runner_macros::ignored]");
-        source = source.replace("#[uzu_bench]", "#[dinghy_apple_runner_macros::bench_case]");
         source = source.replace("#[::criterion_macro::criterion]", "#[dinghy_apple_runner_macros::bench_case]");
         source = source.replace("#[criterion_macro::criterion]", "#[dinghy_apple_runner_macros::bench_case]");
         source = source.replace("#[criterion]", "#[dinghy_apple_runner_macros::bench_case]");
+        for (from, to) in &config.test_attribute_aliases {
+            let pattern = format!("#[{from}]");
+            let replacement = format!("#[{to}]");
+            source = source.replace(&pattern, &replacement);
+        }
         fs::write(path, source)?;
     }
     Ok(())
@@ -270,7 +279,55 @@ fn write_workspace_manifest(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_runner_manifest(runner_crate_root: &Path, resolved_target: &ResolvedTarget) -> Result<()> {
+fn custom_cfgs(config: &DinghyWorkspaceConfig) -> BTreeSet<String> {
+    let mut cfgs = BTreeSet::from([String::from("dinghy_force_test")]);
+    cfgs.extend(config.forward_cfgs.iter().cloned());
+    cfgs
+}
+
+fn render_check_cfg_line(config: &DinghyWorkspaceConfig) -> String {
+    let cfgs = custom_cfgs(config)
+        .into_iter()
+        .map(|cfg| format!("'cfg({cfg})'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("unexpected_cfgs = {{ level = \"allow\", check-cfg = [{cfgs}] }}")
+}
+
+fn appended_cfg_flags(config: &DinghyWorkspaceConfig) -> Vec<String> {
+    custom_cfgs(config)
+        .into_iter()
+        .flat_map(|cfg| {
+            let check_cfg = format!("cfg({cfg})");
+            ["--cfg".to_string(), cfg, "--check-cfg".to_string(), check_cfg]
+        })
+        .collect()
+}
+
+fn configure_rustflags_env(command: &mut Command, config: &DinghyWorkspaceConfig) {
+    let flags = appended_cfg_flags(config);
+    if let Ok(mut encoded_rustflags) = env::var("CARGO_ENCODED_RUSTFLAGS") {
+        if !encoded_rustflags.is_empty() {
+            encoded_rustflags.push(RUSTFLAGS_ENCODED_SEPARATOR);
+        }
+        encoded_rustflags.push_str(&flags.join(&RUSTFLAGS_ENCODED_SEPARATOR.to_string()));
+        command.env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags);
+        return;
+    }
+
+    let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        rustflags.push(' ');
+    }
+    rustflags.push_str(&flags.join(" "));
+    command.env("RUSTFLAGS", rustflags);
+}
+
+fn write_runner_manifest(
+    runner_crate_root: &Path,
+    resolved_target: &ResolvedTarget,
+    config: &DinghyWorkspaceConfig,
+) -> Result<()> {
     let package_root = resolved_target.package.manifest_path.parent().unwrap().as_std_path();
     let dinghy_root = dinghy_workspace_root();
     let mut manifest = String::new();
@@ -280,7 +337,8 @@ fn write_runner_manifest(runner_crate_root: &Path, resolved_target: &ResolvedTar
     manifest.push_str("edition = \"2021\"\n\n");
     manifest.push_str("[lib]\npath = \"src/lib.rs\"\n\n");
     manifest.push_str("[lints.rust]\n");
-    manifest.push_str("unexpected_cfgs = { level = \"allow\", check-cfg = ['cfg(metal_backend)', 'cfg(dinghy_force_test)', 'cfg(grammar_xgrammar)'] }\n\n");
+    manifest.push_str(&render_check_cfg_line(config));
+    manifest.push_str("\n\n");
     manifest.push_str("[dependencies]\n");
     manifest.push_str(&format!(
         "dinghy-apple-runner-support = {{ path = {:?} }}\n",
@@ -549,7 +607,7 @@ pub fn run() -> i32 {{
     Ok(())
 }
 
-fn write_host_manifest(host_crate_root: &Path) -> Result<()> {
+fn write_host_manifest(host_crate_root: &Path, config: &DinghyWorkspaceConfig) -> Result<()> {
     let package_root = dinghy_workspace_root();
     let manifest = format!(
         r#"[package]
@@ -566,9 +624,10 @@ dinghy-apple-host-runtime = {{ path = {:?} }}
 dinghy-generated-apple-runner = {{ path = "../runner" }}
 
 [lints.rust]
-unexpected_cfgs = {{ level = "allow", check-cfg = ['cfg(metal_backend)', 'cfg(dinghy_force_test)', 'cfg(grammar_xgrammar)'] }}
+{}
 "#,
-        package_root.join("dinghy-apple-host-runtime")
+        package_root.join("dinghy-apple-host-runtime"),
+        render_check_cfg_line(config)
     );
     fs::write(host_crate_root.join("Cargo.toml"), manifest)?;
     Ok(())
@@ -587,7 +646,7 @@ fn build_host_app_binary(
     rustc_triple: &str,
     bundle_executable: &Path,
     release: bool,
-    is_uzu_package: bool,
+    config: &DinghyWorkspaceConfig,
 ) -> Result<()> {
     let cargo = env::var("CARGO")
         .map(PathBuf::from)
@@ -607,20 +666,7 @@ fn build_host_app_binary(
         command.arg("--release");
     }
 
-    let mut rustflags = env::var("RUSTFLAGS").unwrap_or_default();
-    for cfg in ["dinghy_force_test", "metal_backend", "grammar_xgrammar"] {
-        if cfg != "dinghy_force_test" && !is_uzu_package {
-            continue;
-        }
-        if !rustflags.is_empty() {
-            rustflags.push(' ');
-        }
-        rustflags.push_str("--cfg ");
-        rustflags.push_str(cfg);
-    }
-    if !rustflags.is_empty() {
-        command.env("RUSTFLAGS", rustflags);
-    }
+    configure_rustflags_env(&mut command, config);
 
     let status = command.log_invocation(1).status()?;
     if !status.success() {

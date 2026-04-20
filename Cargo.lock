@@ -409,6 +409,7 @@ dependencies = [
  "regex",
  "semver",
  "serde",
+ "serde_json",
  "shell-escape",
  "shellexpand",
  "tempfile",

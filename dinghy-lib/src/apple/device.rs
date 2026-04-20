@@ -194,6 +194,30 @@ impl IosDevice {
             .context("Failed to run devicectl device process launch")
     }
 
+    fn probe_device_path_exists(
+        &self,
+        build_bundle: &BuildBundle,
+        device_path: &str,
+    ) -> Result<bool> {
+        let app_id = self.app_id(build_bundle)?;
+        let status = process::Command::new("xcrun")
+            .args(
+                "devicectl device info files --domain-type appDataContainer --device"
+                    .split_whitespace(),
+            )
+            .arg(self.devicectl_id())
+            .arg("--domain-identifier")
+            .arg(app_id)
+            .arg("--subdirectory")
+            .arg(device_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .log_invocation(2)
+            .status()
+            .context("Failed to run devicectl device info files")?;
+        Ok(status.success())
+    }
+
     fn sync_dirs_to_device(
         &self,
         build_bundle: &BuildBundle,
@@ -202,10 +226,10 @@ impl IosDevice {
         for spec in sync_dirs {
             if !spec.host_path.exists() {
                 debug!(
-                    "Skipping sync to device for missing host path {}",
+                    "Host path {} missing; creating empty directory before sync to device",
                     spec.host_path.display()
                 );
-                continue;
+                fs::create_dir_all(&spec.host_path)?;
             }
             self.copy_to_device(build_bundle, &spec.host_path, &spec.device_path)?;
         }
@@ -218,6 +242,17 @@ impl IosDevice {
         sync_dirs: &[SyncDirSpec],
     ) -> Result<()> {
         for spec in sync_dirs {
+            if !self.probe_device_path_exists(build_bundle, &spec.device_path)? {
+                debug!(
+                    "Device path {} missing; leaving host path {} untouched",
+                    spec.device_path,
+                    spec.host_path.display()
+                );
+                continue;
+            }
+            if spec.host_path.exists() {
+                fs::remove_dir_all(&spec.host_path)?;
+            }
             fs::create_dir_all(&spec.host_path)?;
             self.copy_from_device(build_bundle, &spec.device_path, &spec.host_path)?;
         }

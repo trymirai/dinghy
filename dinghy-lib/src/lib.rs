@@ -8,6 +8,7 @@ mod android;
 mod apple;
 pub mod config;
 pub mod device;
+pub mod dinghy_config;
 mod host;
 pub mod overlay;
 pub mod platform;
