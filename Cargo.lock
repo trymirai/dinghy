@@ -144,6 +144,7 @@ dependencies = [
  "dinghy-lib",
  "env_logger",
  "log",
+ "toml",
 ]
 
 [[package]]

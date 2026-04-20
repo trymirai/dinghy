@@ -72,7 +72,10 @@ pub fn prepare_generated_apple_host(
     )?;
     rewrite_rust_sources(&source_root, &dinghy_config)?;
 
-    write_workspace_manifest(&workspace_root)?;
+    write_workspace_manifest(
+        &workspace_root,
+        project.metadata.workspace_root.as_std_path(),
+    )?;
     write_runner_manifest(&runner_crate_root, &resolved_target, &dinghy_config)?;
     write_runner_source(&runner_crate_root, &source_root, &resolved_target)?;
     write_host_manifest(&host_crate_root, &dinghy_config)?;
@@ -271,12 +274,35 @@ fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<(
     Ok(())
 }
 
-fn write_workspace_manifest(workspace_root: &Path) -> Result<()> {
-    fs::write(
-        workspace_root.join("Cargo.toml"),
+fn write_workspace_manifest(
+    workspace_root: &Path,
+    outer_workspace_root: &Path,
+) -> Result<()> {
+    let mut manifest = String::from(
         "[workspace]\nresolver = \"2\"\nmembers = [\"runner\", \"host\"]\n",
-    )?;
+    );
+    let profile = extract_workspace_profile_toml(outer_workspace_root)?;
+    if !profile.is_empty() {
+        manifest.push('\n');
+        manifest.push_str(&profile);
+    }
+    fs::write(workspace_root.join("Cargo.toml"), manifest)?;
     Ok(())
+}
+
+fn extract_workspace_profile_toml(outer_workspace_root: &Path) -> Result<String> {
+    let manifest_path = outer_workspace_root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Reading outer workspace manifest {}", manifest_path.display()))?;
+    let parsed: toml::Value = toml::from_str(&manifest)
+        .with_context(|| format!("Parsing outer workspace manifest {}", manifest_path.display()))?;
+    let Some(profile) = parsed.get("profile") else {
+        return Ok(String::new());
+    };
+    let mut wrapper = toml::value::Table::new();
+    wrapper.insert("profile".to_owned(), profile.clone());
+    toml::to_string(&toml::Value::Table(wrapper))
+        .context("Serializing inherited [profile] table")
 }
 
 fn custom_cfgs(config: &DinghyWorkspaceConfig) -> BTreeSet<String> {
