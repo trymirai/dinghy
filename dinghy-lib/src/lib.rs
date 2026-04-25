@@ -282,7 +282,6 @@ pub struct SetupArgs {
     pub cleanup: bool,
     pub strip: bool,
     pub device_id: Option<String>,
-    pub copy_back: Vec<SyncDirSpec>,
     pub sync_dirs: Vec<SyncDirSpec>,
 }
 
@@ -313,11 +312,6 @@ impl SetupArgs {
         for env in &self.envs {
             extra_args.push_str("-e ");
             extra_args.push_str(env);
-            extra_args.push(' ');
-        }
-        for spec in &self.copy_back {
-            extra_args.push_str("--copy-back ");
-            extra_args.push_str(&spec.as_cli_arg());
             extra_args.push(' ');
         }
         for spec in &self.sync_dirs {

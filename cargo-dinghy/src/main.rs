@@ -56,7 +56,6 @@ fn run_command(cli: DinghyCli) -> Result<()> {
     let workspace_root = project.metadata.workspace_root.as_std_path();
 
     let (platform, device) = select_platform_and_device_from_cli(&cli, &dinghy)?;
-    let copy_back = resolve_sync_dir_specs(&cli.args.copy_back, workspace_root)?;
     let sync_dirs = resolve_sync_dir_specs(&cli.args.sync_dirs, workspace_root)?;
 
     let setup_args = SetupArgs {
@@ -66,7 +65,6 @@ fn run_command(cli: DinghyCli) -> Result<()> {
         cleanup: cli.args.cleanup,
         strip: cli.args.strip, // TODO this should probably be configurable in the config as well
         device_id: device.as_ref().map(|d| d.id().to_string()),
-        copy_back,
         sync_dirs,
     };
 
@@ -212,10 +210,6 @@ fn run_command(cli: DinghyCli) -> Result<()> {
                     &project, &build, &args_ref,
                     &envs_ref, // TODO these are also in the SetupArgs
                 )?;
-
-                for spec in &build.setup_args.copy_back {
-                    device.copy_from_device(&bundle, &spec.device_path, &spec.host_path)?;
-                }
 
                 // TODO this is not done if the run fails
                 if cli.args.cleanup {
