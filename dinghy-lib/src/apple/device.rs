@@ -194,43 +194,6 @@ impl IosDevice {
             .context("Failed to run devicectl device process launch")
     }
 
-    fn copy_to_app_data_container(
-        &self,
-        bundle: &BuildBundle,
-        host_source: &Path,
-    ) -> Result<()> {
-        let app_id = self.app_id(bundle)?;
-        user_facing_log(
-            "Copying",
-            &format!(
-                "{} from host to {}",
-                host_source.display(),
-                "<app data container>"
-            ),
-            0,
-        );
-        let status = process::Command::new("xcrun")
-            .args(
-                "devicectl device copy to --domain-type appDataContainer --device"
-                    .split_whitespace(),
-            )
-            .arg(self.devicectl_id())
-            .arg("--domain-identifier")
-            .arg(app_id)
-            .arg("--source")
-            .arg(host_source)
-            .log_invocation(1)
-            .status()
-            .context("Failed to run devicectl device copy to")?;
-        if !status.success() {
-            bail!(
-                "devicectl device copy to failed (exit code: {:?})",
-                status.code()
-            );
-        }
-        Ok(())
-    }
-
     fn copy_to_device_replacing(
         &self,
         bundle: &BuildBundle,
@@ -297,42 +260,6 @@ impl IosDevice {
         Ok(status.success())
     }
 
-    fn create_device_directory(
-        &self,
-        build_bundle: &BuildBundle,
-        device_path: &str,
-    ) -> Result<()> {
-        let components = device_path
-            .split('/')
-            .filter(|component| !component.is_empty() && *component != ".")
-            .collect::<Vec<_>>();
-        if components.is_empty() {
-            return Ok(());
-        }
-
-        let temp_dir = tempfile::TempDir::with_prefix("dinghy-sync-dir")?;
-        let staged_source = components
-            .iter()
-            .fold(temp_dir.path().to_path_buf(), |path, component| {
-                path.join(component)
-            });
-        fs::create_dir_all(&staged_source)?;
-        fs::write(staged_source.join(".dinghy-sync-placeholder"), [])?;
-
-        self.copy_to_app_data_container(build_bundle, temp_dir.path())
-    }
-
-    fn clear_device_directory_contents(
-        &self,
-        build_bundle: &BuildBundle,
-        device_path: &str,
-    ) -> Result<()> {
-        self.create_device_directory(build_bundle, device_path)?;
-
-        let temp_dir = tempfile::TempDir::with_prefix("dinghy-empty-sync-dir")?;
-        self.copy_to_device_replacing(build_bundle, temp_dir.path(), device_path)
-    }
-
     fn sync_dirs_to_device(
         &self,
         build_bundle: &BuildBundle,
@@ -341,12 +268,25 @@ impl IosDevice {
         for spec in sync_dirs {
             if !spec.host_path.exists() {
                 debug!(
-                    "Host path {} missing; creating empty directory before sync to device",
+                    "Host path {} missing; skipping initial sync to device",
                     spec.host_path.display()
                 );
-                fs::create_dir_all(&spec.host_path)?;
+                continue;
             }
-            self.create_device_directory(build_bundle, &spec.device_path)?;
+            if !spec.host_path.is_dir() {
+                bail!(
+                    "sync dir host path must be a directory: {}",
+                    spec.host_path.display()
+                );
+            }
+            if !self.probe_device_path_exists(build_bundle, &spec.device_path)? {
+                debug!(
+                    "Device path {} missing; skipping initial sync from host path {}",
+                    spec.device_path,
+                    spec.host_path.display()
+                );
+                continue;
+            }
             self.copy_to_device_replacing(build_bundle, &spec.host_path, &spec.device_path)?;
         }
         Ok(())
@@ -371,7 +311,6 @@ impl IosDevice {
             }
             fs::create_dir_all(&spec.host_path)?;
             self.copy_from_device(build_bundle, &spec.device_path, &spec.host_path)?;
-            self.clear_device_directory_contents(build_bundle, &spec.device_path)?;
         }
         Ok(())
     }
@@ -400,19 +339,12 @@ impl IosDevice {
         let app_id = self.app_id(build_bundle)?;
         self.sync_dirs_to_device(build_bundle, &build.setup_args.sync_dirs)?;
         let status = self.launch_app_with_devicectl(app_id, args, envs)?;
-        let post_sync_result = self.sync_dirs_from_device(build_bundle, &build.setup_args.sync_dirs);
 
         if !status.success() {
-            if let Err(sync_error) = post_sync_result {
-                log::warn!(
-                    "Failed to sync directories back from device after unsuccessful run: {}",
-                    sync_error
-                );
-            }
             bail!("Run on device failed (exit code: {:?})", status.code());
         }
 
-        post_sync_result?;
+        self.sync_dirs_from_device(build_bundle, &build.setup_args.sync_dirs)?;
         Ok(())
     }
 }
