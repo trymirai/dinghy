@@ -194,42 +194,73 @@ impl IosDevice {
             .context("Failed to run devicectl device process launch")
     }
 
-    fn copy_to_device_replacing(
+    fn copy_to_app_data_container(
         &self,
         bundle: &BuildBundle,
         host_source: &Path,
-        device_destination: Option<&str>,
     ) -> Result<()> {
         let app_id = self.app_id(bundle)?;
-        let destination = device_destination.unwrap_or("<app data container>");
         user_facing_log(
             "Copying",
             &format!(
                 "{} from host to {}",
                 host_source.display(),
-                destination
+                "<app data container>"
             ),
             0,
         );
-        let mut command = process::Command::new("xcrun");
-        command.args(
-            "devicectl device copy to --domain-type appDataContainer --device".split_whitespace(),
-        );
-        command
+        let status = process::Command::new("xcrun")
+            .args(
+                "devicectl device copy to --domain-type appDataContainer --device"
+                    .split_whitespace(),
+            )
             .arg(self.devicectl_id())
             .arg("--domain-identifier")
             .arg(app_id)
             .arg("--source")
-            .arg(host_source);
-        if let Some(device_destination) = device_destination {
-            command
-                .arg("--destination")
-                .arg(device_destination)
-                .arg("--remove-existing-content")
-                .arg("true");
+            .arg(host_source)
+            .log_invocation(1)
+            .status()
+            .context("Failed to run devicectl device copy to")?;
+        if !status.success() {
+            bail!(
+                "devicectl device copy to failed (exit code: {:?})",
+                status.code()
+            );
         }
+        Ok(())
+    }
 
-        let status = command
+    fn copy_to_device_replacing(
+        &self,
+        bundle: &BuildBundle,
+        host_source: &Path,
+        device_destination: &str,
+    ) -> Result<()> {
+        let app_id = self.app_id(bundle)?;
+        user_facing_log(
+            "Copying",
+            &format!(
+                "{} from host to {}",
+                host_source.display(),
+                device_destination
+            ),
+            0,
+        );
+        let status = process::Command::new("xcrun")
+            .args(
+                "devicectl device copy to --domain-type appDataContainer --device"
+                    .split_whitespace(),
+            )
+            .arg(self.devicectl_id())
+            .arg("--domain-identifier")
+            .arg(app_id)
+            .arg("--source")
+            .arg(host_source)
+            .arg("--destination")
+            .arg(device_destination)
+            .arg("--remove-existing-content")
+            .arg("true")
             .log_invocation(1)
             .status()
             .context("Failed to run devicectl device copy to")?;
@@ -286,9 +317,9 @@ impl IosDevice {
                 path.join(component)
             });
         fs::create_dir_all(&staged_source)?;
+        fs::write(staged_source.join(".dinghy-sync-placeholder"), [])?;
 
-        let source_root = temp_dir.path().join(components[0]);
-        self.copy_to_device_replacing(build_bundle, &source_root, None)
+        self.copy_to_app_data_container(build_bundle, temp_dir.path())
     }
 
     fn clear_device_directory_contents(
@@ -299,7 +330,7 @@ impl IosDevice {
         self.create_device_directory(build_bundle, device_path)?;
 
         let temp_dir = tempfile::TempDir::with_prefix("dinghy-empty-sync-dir")?;
-        self.copy_to_device_replacing(build_bundle, temp_dir.path(), Some(device_path))
+        self.copy_to_device_replacing(build_bundle, temp_dir.path(), device_path)
     }
 
     fn sync_dirs_to_device(
@@ -316,7 +347,7 @@ impl IosDevice {
                 fs::create_dir_all(&spec.host_path)?;
             }
             self.create_device_directory(build_bundle, &spec.device_path)?;
-            self.copy_to_device_replacing(build_bundle, &spec.host_path, Some(&spec.device_path))?;
+            self.copy_to_device_replacing(build_bundle, &spec.host_path, &spec.device_path)?;
         }
         Ok(())
     }
@@ -447,7 +478,7 @@ impl Device for IosDevice {
         host_source: &Path,
         device_destination: &str,
     ) -> Result<()> {
-        self.copy_to_device_replacing(bundle, host_source, Some(device_destination))
+        self.copy_to_device_replacing(bundle, host_source, device_destination)
     }
 
     fn copy_from_device(
