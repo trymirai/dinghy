@@ -60,7 +60,18 @@ pub fn prepare_generated_apple_host(
     let runner_crate_root = workspace_root.join("runner");
     let host_crate_root = workspace_root.join("host");
 
-    let _ = fs::remove_dir_all(&generated_root);
+    // Regenerate the source copy + generated crates each run, but preserve
+    // `workspace/Cargo.lock` so the inner build can resolve offline on warm
+    // runs (see `build_host_app_binary`). `source/` is fully re-copied (with
+    // mtimes preserved by `rec_copy_excl`), so upstream deletions never leave
+    // stale files. `DINGHY_APPLE_HOST_CLEAN=1` forces a full wipe.
+    if env::var_os("DINGHY_APPLE_HOST_CLEAN").is_some() {
+        let _ = fs::remove_dir_all(&generated_root);
+    } else {
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&runner_crate_root);
+        let _ = fs::remove_dir_all(&host_crate_root);
+    }
     fs::create_dir_all(&generated_root)?;
     fs::create_dir_all(&workspace_root)?;
     fs::create_dir_all(runner_crate_root.join("src"))?;
@@ -80,8 +91,13 @@ pub fn prepare_generated_apple_host(
     write_runner_source(&runner_crate_root, &source_root, &resolved_target)?;
     write_host_manifest(&host_crate_root, &dinghy_config)?;
     write_host_main(&host_crate_root)?;
+    // Persistent build cache for the inner apple-host build, kept OUTSIDE
+    // `generated_root` (which is wiped) and shared across all bench/test ids so
+    // dependency artifacts + the cached metallib survive between runs.
+    let host_target_dir = build.target_path.join("dinghy-apple-host-target");
     build_host_app_binary(
         &workspace_root,
+        &host_target_dir,
         platform.rustc_triple(),
         &bundle.bundle_exe,
         build.runnable.exe.to_string_lossy().contains("/release/"),
@@ -254,7 +270,8 @@ fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<(
             continue;
         }
 
-        let mut source = fs::read_to_string(&path)?;
+        let original = fs::read_to_string(&path)?;
+        let mut source = original.clone();
         source = inject_rstest_test_attr(&source).unwrap_or(source);
         source = source.replace("#![feature(custom_test_frameworks)]", "");
         source = source.replace("#![test_runner(crate::bench_runner)]", "");
@@ -270,7 +287,20 @@ fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<(
             let replacement = format!("#[{to}]");
             source = source.replace(&pattern, &replacement);
         }
-        fs::write(path, source)?;
+
+        // Skip the write when the transform is a no-op, and otherwise restore
+        // the original mtime (the source file's, set by the mtime-preserving
+        // copy). This keeps the copied crate's sources at a stable mtime across
+        // runs so cargo treats them as fresh and does not recompile them.
+        if source != original {
+            let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+            fs::write(&path, source)?;
+            if let Some(mtime) = mtime {
+                if let Ok(file) = fs::File::options().write(true).open(&path) {
+                    let _ = file.set_modified(mtime);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -793,6 +823,7 @@ fn write_runner_build_script(runner_crate_root: &Path) -> Result<()> {
 
 fn build_host_app_binary(
     workspace_root: &Path,
+    target_dir: &Path,
     rustc_triple: &str,
     bundle_executable: &Path,
     release: bool,
@@ -812,6 +843,13 @@ fn build_host_app_binary(
     command.arg("dinghy-generated-apple-host");
     command.arg("--target");
     command.arg(rustc_triple);
+    command.arg("--target-dir");
+    command.arg(target_dir);
+    // Once a lockfile exists (written by the first resolve), reuse it offline so
+    // later runs skip the crates.io index update + dependency re-resolution.
+    if workspace_root.join("Cargo.lock").exists() {
+        command.arg("--offline");
+    }
     if release {
         command.arg("--release");
     }
@@ -824,8 +862,7 @@ fn build_host_app_binary(
     }
 
     let profile = if release { "release" } else { "debug" };
-    let built_binary = workspace_root
-        .join("target")
+    let built_binary = target_dir
         .join(rustc_triple)
         .join(profile)
         .join("dinghy-generated-apple-host");
