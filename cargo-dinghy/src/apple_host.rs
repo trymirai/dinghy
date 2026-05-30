@@ -60,11 +60,6 @@ pub fn prepare_generated_apple_host(
     let runner_crate_root = workspace_root.join("runner");
     let host_crate_root = workspace_root.join("host");
 
-    // Regenerate the source copy + generated crates each run, but preserve
-    // `workspace/Cargo.lock` so the inner build can resolve offline on warm
-    // runs (see `build_host_app_binary`). `source/` is fully re-copied (with
-    // mtimes preserved by `rec_copy_excl`), so upstream deletions never leave
-    // stale files. `DINGHY_APPLE_HOST_CLEAN=1` forces a full wipe.
     if env::var_os("DINGHY_APPLE_HOST_CLEAN").is_some() {
         let _ = fs::remove_dir_all(&generated_root);
     } else {
@@ -91,9 +86,6 @@ pub fn prepare_generated_apple_host(
     write_runner_source(&runner_crate_root, &source_root, &resolved_target)?;
     write_host_manifest(&host_crate_root, &dinghy_config)?;
     write_host_main(&host_crate_root)?;
-    // Persistent build cache for the inner apple-host build, kept OUTSIDE
-    // `generated_root` (which is wiped) and shared across all bench/test ids so
-    // dependency artifacts + the cached metallib survive between runs.
     let host_target_dir = build.target_path.join("dinghy-apple-host-target");
     build_host_app_binary(
         &workspace_root,
@@ -288,10 +280,6 @@ fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<(
             source = source.replace(&pattern, &replacement);
         }
 
-        // Skip the write when the transform is a no-op, and otherwise restore
-        // the original mtime (the source file's, set by the mtime-preserving
-        // copy). This keeps the copied crate's sources at a stable mtime across
-        // runs so cargo treats them as fresh and does not recompile them.
         if source != original {
             let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
             fs::write(&path, source)?;
@@ -845,8 +833,6 @@ fn build_host_app_binary(
     command.arg(rustc_triple);
     command.arg("--target-dir");
     command.arg(target_dir);
-    // Once a lockfile exists (written by the first resolve), reuse it offline so
-    // later runs skip the crates.io index update + dependency re-resolution.
     if workspace_root.join("Cargo.lock").exists() {
         command.arg("--offline");
     }

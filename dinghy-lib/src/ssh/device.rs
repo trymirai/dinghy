@@ -31,11 +31,6 @@ impl SshDevice {
             0,
         );
 
-        // A prebuilt bundle (e.g. the generated Apple host `.app` wrapper used
-        // for Metal/GPU access) is already fully assembled. Reusing it is
-        // mandatory here: calling `make_remote_app` would `remove_dir_all` the
-        // package bundle dir, which is the *parent* of the prebuilt
-        // `Dinghy.app`, destroying the wrapper exe before it can be synced.
         let build_bundle = if let Some(build_bundle) = build.prebuilt_bundle.clone() {
             log::debug!("reusing prebuilt bundle {}", build.runnable.id);
             build_bundle
