@@ -255,6 +255,7 @@ fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<(
         }
 
         let mut source = fs::read_to_string(&path)?;
+        source = inject_rstest_test_attr(&source).unwrap_or(source);
         source = source.replace("#![feature(custom_test_frameworks)]", "");
         source = source.replace("#![test_runner(crate::bench_runner)]", "");
         source = source.replace("#![reexport_test_harness_main = \"test_main\"]", "");
@@ -272,6 +273,111 @@ fn rewrite_rust_sources(root: &Path, config: &DinghyWorkspaceConfig) -> Result<(
         fs::write(path, source)?;
     }
     Ok(())
+}
+
+/// For every `#[rstest]` function in `source`, inject
+/// `#[test_attr(dinghy_apple_runner_macros::test_case)]` immediately before the
+/// `fn` keyword so that each rstest-generated case is registered with the
+/// dinghy inventory runner instead of being silently dropped as `#[test]`.
+///
+/// Returns the rewritten source, or `None` if the file cannot be parsed (in
+/// which case the caller keeps the original source unchanged).
+fn inject_rstest_test_attr(source: &str) -> Option<String> {
+    let file = syn::parse_file(source).ok()?;
+    let injection_offsets = collect_rstest_injection_offsets(source, &file);
+    if injection_offsets.is_empty() {
+        return None;
+    }
+    let injection = "#[test_attr(dinghy_apple_runner_macros::test_case)]\n";
+    let mut rewritten = String::with_capacity(source.len() + injection_offsets.len() * injection.len());
+    let mut cursor = 0usize;
+    for (offset, indent) in injection_offsets {
+        rewritten.push_str(&source[cursor..offset]);
+        rewritten.push_str(injection);
+        rewritten.push_str(&indent);
+        cursor = offset;
+    }
+    rewritten.push_str(&source[cursor..]);
+    Some(rewritten)
+}
+
+/// Walks the parsed file collecting `(byte_offset_of_fn_token, indentation)`
+/// for every rstest-annotated function. The offsets are returned in source
+/// order so that the rewriter can splice in attributes without recomputing
+/// positions after each insertion.
+fn collect_rstest_injection_offsets(source: &str, file: &syn::File) -> Vec<(usize, String)> {
+    let line_starts = compute_line_starts(source);
+    let mut offsets = Vec::new();
+    collect_rstest_offsets_in_items(&file.items, source, &line_starts, &mut offsets);
+    offsets.sort_by_key(|(offset, _)| *offset);
+    offsets
+}
+
+fn collect_rstest_offsets_in_items(
+    items: &[syn::Item],
+    source: &str,
+    line_starts: &[usize],
+    offsets: &mut Vec<(usize, String)>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Fn(item_fn) => {
+                if let Some(offset) = rstest_injection_offset(item_fn, source, line_starts) {
+                    offsets.push(offset);
+                }
+            },
+            syn::Item::Mod(item_mod) => {
+                if let Some((_, inner_items)) = &item_mod.content {
+                    collect_rstest_offsets_in_items(inner_items, source, line_starts, offsets);
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+fn rstest_injection_offset(
+    item_fn: &syn::ItemFn,
+    source: &str,
+    line_starts: &[usize],
+) -> Option<(usize, String)> {
+    if !item_fn.attrs.iter().any(is_rstest_attribute) {
+        return None;
+    }
+    let fn_span_start = item_fn.sig.fn_token.span.start();
+    let line_offset = line_starts.get(fn_span_start.line.checked_sub(1)?)?;
+    let line_end = source[*line_offset..]
+        .find('\n')
+        .map(|n| line_offset + n)
+        .unwrap_or(source.len());
+    let line = &source[*line_offset..line_end];
+    let column_byte_offset = line
+        .char_indices()
+        .nth(fn_span_start.column)
+        .map(|(byte, _)| byte)
+        .unwrap_or(line.len());
+    let absolute_offset = line_offset + column_byte_offset;
+    let indent = line[..column_byte_offset].to_string();
+    Some((absolute_offset, indent))
+}
+
+fn is_rstest_attribute(attribute: &syn::Attribute) -> bool {
+    attribute
+        .path()
+        .segments
+        .last()
+        .map(|segment| segment.ident == "rstest")
+        .unwrap_or(false)
+}
+
+fn compute_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (offset, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(offset + 1);
+        }
+    }
+    starts
 }
 
 fn write_workspace_manifest(
@@ -356,11 +462,13 @@ fn write_runner_manifest(
 ) -> Result<()> {
     let package_root = resolved_target.package.manifest_path.parent().unwrap().as_std_path();
     let dinghy_root = dinghy_workspace_root();
+    write_runner_build_script(runner_crate_root)?;
     let mut manifest = String::new();
     manifest.push_str("[package]\n");
     manifest.push_str("name = \"dinghy-generated-apple-runner\"\n");
     manifest.push_str("version = \"0.1.0\"\n");
-    manifest.push_str("edition = \"2021\"\n\n");
+    manifest.push_str("edition = \"2021\"\n");
+    manifest.push_str("build = \"build.rs\"\n\n");
     manifest.push_str("[lib]\npath = \"src/lib.rs\"\n\n");
     manifest.push_str("[lints.rust]\n");
     manifest.push_str(&render_check_cfg_line(config));
@@ -667,6 +775,22 @@ fn write_host_main(host_crate_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The runner crate `include!`s the user's test source, which may rely on
+/// crates like `rstest` that emit `#[cfg(test)]` gates during macro
+/// expansion. Those gates are invisible to the textual `cfg(test)` rewrite in
+/// [`rewrite_rust_sources`], so the only way to make them active is to ask
+/// rustc to set `cfg(test)` for this specific package via a build script.
+/// Limiting the cfg to the runner package avoids polluting downstream
+/// dependencies that should keep `cfg(test)` disabled in a `cargo build`.
+fn write_runner_build_script(runner_crate_root: &Path) -> Result<()> {
+    let build_script = "fn main() {\n\
+        println!(\"cargo:rustc-cfg=test\");\n\
+        println!(\"cargo:rustc-check-cfg=cfg(test)\");\n\
+    }\n";
+    fs::write(runner_crate_root.join("build.rs"), build_script)?;
+    Ok(())
+}
+
 fn build_host_app_binary(
     workspace_root: &Path,
     rustc_triple: &str,
@@ -707,4 +831,39 @@ fn build_host_app_binary(
         .join("dinghy-generated-apple-host");
     fs::copy(&built_binary, bundle_executable)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::inject_rstest_test_attr;
+
+    #[test]
+    fn injects_test_attr_before_rstest_function() {
+        let source = "#[rstest]\n#[case(1)]\n#[case(2)]\nfn foo(x: u32) {}\n";
+        let rewritten = inject_rstest_test_attr(source).expect("rewrite");
+        let expected = "#[rstest]\n#[case(1)]\n#[case(2)]\n#[test_attr(dinghy_apple_runner_macros::test_case)]\nfn foo(x: u32) {}\n";
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn handles_indented_function() {
+        let source = "mod inner {\n    #[rstest]\n    #[case(1)]\n    fn foo(x: u32) {}\n}\n";
+        let rewritten = inject_rstest_test_attr(source).expect("rewrite");
+        let expected = "mod inner {\n    #[rstest]\n    #[case(1)]\n    #[test_attr(dinghy_apple_runner_macros::test_case)]\n    fn foo(x: u32) {}\n}\n";
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn skips_non_rstest_functions() {
+        let source = "#[test]\nfn foo() {}\n";
+        assert!(inject_rstest_test_attr(source).is_none());
+    }
+
+    #[test]
+    fn injects_for_multiple_rstest_functions_in_order() {
+        let source = "#[rstest]\nfn a() {}\n\n#[rstest]\nfn b() {}\n";
+        let rewritten = inject_rstest_test_attr(source).expect("rewrite");
+        let expected = "#[rstest]\n#[test_attr(dinghy_apple_runner_macros::test_case)]\nfn a() {}\n\n#[rstest]\n#[test_attr(dinghy_apple_runner_macros::test_case)]\nfn b() {}\n";
+        assert_eq!(rewritten, expected);
+    }
 }

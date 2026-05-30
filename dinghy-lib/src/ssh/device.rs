@@ -31,10 +31,20 @@ impl SshDevice {
             0,
         );
 
-        log::debug!("make_remote_app {}", build.runnable.id);
-        let build_bundle = make_remote_app(project, build)?;
-
-        log::trace!("make_remote_app {} done", build.runnable.id);
+        // A prebuilt bundle (e.g. the generated Apple host `.app` wrapper used
+        // for Metal/GPU access) is already fully assembled. Reusing it is
+        // mandatory here: calling `make_remote_app` would `remove_dir_all` the
+        // package bundle dir, which is the *parent* of the prebuilt
+        // `Dinghy.app`, destroying the wrapper exe before it can be synced.
+        let build_bundle = if let Some(build_bundle) = build.prebuilt_bundle.clone() {
+            log::debug!("reusing prebuilt bundle {}", build.runnable.id);
+            build_bundle
+        } else {
+            log::debug!("make_remote_app {}", build.runnable.id);
+            let build_bundle = make_remote_app(project, build)?;
+            log::trace!("make_remote_app {} done", build.runnable.id);
+            build_bundle
+        };
         let remote_bundle = self.to_remote_bundle(&build_bundle)?;
         log::trace!("Create remote dir: {:?}", remote_bundle.bundle_dir);
 

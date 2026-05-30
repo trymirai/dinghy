@@ -144,6 +144,8 @@ dependencies = [
  "dinghy-lib",
  "env_logger",
  "log",
+ "proc-macro2",
+ "syn",
  "toml",
 ]
 
