@@ -46,6 +46,12 @@ pub fn prepare_generated_apple_host(
     if !platform.rustc_triple().contains("-apple-") {
         return Ok(None);
     }
+    // Package the prebuilt cargo test/bench binary into Dinghy.app instead of
+    // regenerating a host crate. Needed for packages whose build.rs generates
+    // sources (OUT_DIR) that the include!-based apple-host runner cannot see.
+    if env::var_os("DINGHY_SKIP_APPLE_HOST").is_some() {
+        return Ok(None);
+    }
 
     let resolved_target = resolve_target(project, build, runner_args)?;
     let dinghy_config = DinghyWorkspaceConfig::from_workspace_metadata(
