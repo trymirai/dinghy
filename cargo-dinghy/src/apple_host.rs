@@ -502,7 +502,12 @@ fn write_runner_manifest(
     ));
     manifest.push_str("inventory = \"0.3\"\n");
 
-    if resolved_target.package.targets.iter().any(is_library_target) {
+    // Test/bench runners `include!` the rewritten package sources, so linking the
+    // same package as a path dependency would compile it twice and break
+    // `extern crate self as <package>`.
+    if !matches!(resolved_target.kind, RunnerKind::Test | RunnerKind::Bench)
+        && resolved_target.package.targets.iter().any(is_library_target)
+    {
         manifest.push_str(&format!(
             "{} = {{ path = {:?} }}\n",
             resolved_target.package.name,
