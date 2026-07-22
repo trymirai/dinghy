@@ -485,7 +485,7 @@ fn write_runner_manifest(
     manifest.push_str("[package]\n");
     manifest.push_str("name = \"dinghy-generated-apple-runner\"\n");
     manifest.push_str("version = \"0.1.0\"\n");
-    manifest.push_str("edition = \"2021\"\n");
+    manifest.push_str("edition = \"2024\"\n");
     manifest.push_str("build = \"build.rs\"\n\n");
     manifest.push_str("[lib]\npath = \"src/lib.rs\"\n\n");
     manifest.push_str("[lints.rust]\n");
@@ -788,7 +788,7 @@ fn write_host_manifest(host_crate_root: &Path, config: &DinghyWorkspaceConfig) -
         r#"[package]
 name = "dinghy-generated-apple-host"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [[bin]]
 name = "dinghy-generated-apple-host"
