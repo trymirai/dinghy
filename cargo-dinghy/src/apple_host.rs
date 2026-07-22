@@ -555,6 +555,8 @@ fn render_dependency(key: String, dependency: &Dependency) -> Result<String> {
     let mut fields = Vec::new();
     if let Some(path) = &dependency.path {
         fields.push(format!("path = {:?}", path.as_std_path()));
+    } else if let Some(git_fields) = dependency.source.as_deref().and_then(render_git_source_fields) {
+        fields.extend(git_fields);
     } else {
         fields.push(format!("version = {:?}", dependency.req.to_string()));
     }
@@ -562,6 +564,9 @@ fn render_dependency(key: String, dependency: &Dependency) -> Result<String> {
         if rename != &dependency.name {
             fields.push(format!("package = {:?}", dependency.name));
         }
+    }
+    if dependency.optional {
+        fields.push("optional = true".to_string());
     }
     if !dependency.uses_default_features {
         fields.push("default-features = false".to_string());
@@ -576,6 +581,24 @@ fn render_dependency(key: String, dependency: &Dependency) -> Result<String> {
         fields.push(format!("features = [{features}]"));
     }
     Ok(format!("{key} = {{ {} }}", fields.join(", ")))
+}
+
+/// Parse cargo-metadata `git+https://...?tag=…` sources into Cargo.toml fields.
+fn render_git_source_fields(source: &str) -> Option<Vec<String>> {
+    let rest = source.strip_prefix("git+")?;
+    let (url_and_query, _fragment) = rest.split_once('#').unwrap_or((rest, ""));
+    let (url, query) = url_and_query.split_once('?').unwrap_or((url_and_query, ""));
+    if url.is_empty() {
+        return None;
+    }
+    let mut fields = vec![format!("git = {url:?}")];
+    for part in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=')?;
+        if matches!(key, "tag" | "branch" | "rev") {
+            fields.push(format!("{key} = {value:?}"));
+        }
+    }
+    Some(fields)
 }
 
 fn write_runner_source(
